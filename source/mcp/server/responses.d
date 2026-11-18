@@ -11,7 +11,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.errors : internalError;
 import mcp.protocol.versions : ProtocolVersion, isModern, usesMRTR;
-import mcp.protocol.types : CallToolResult, GetPromptResult, Content, ResourceContents;
+import mcp.protocol.types : CallToolResult, GetPromptResult, Content, ResourceContents, Tool;
 import mcp.protocol.mrtr : InputRequest, InputRequiredResult;
 import mcp.server.context : RequestContext;
 
@@ -48,6 +48,16 @@ class PromptError : Exception
 
 /// A tool handler receiving the parsed arguments and the per-request context.
 alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) @safe;
+
+/// A handler for an application-defined JSON-RPC method (see
+/// `McpServer.registerMethod`): receives the request's raw `params` and the
+/// per-request context, and returns the `result` object. Throwing an
+/// `McpException` answers with that exception's error code.
+alias MethodHandler = Json delegate(Json params, RequestContext ctx) @safe;
+
+/// A per-request `tools/list` predicate (see `McpServer.setToolListFilter`):
+/// returns true to list `tool` for the request described by `ctx`.
+alias ToolListFilter = bool delegate(const ref Tool tool, RequestContext ctx) @safe;
 
 /// A tool handler that may, on a stateless (MRTR) request, ask the client for
 /// more input instead of returning a final result. See `ToolResponse`.

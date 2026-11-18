@@ -33,7 +33,8 @@ import mcp.server.event_store : WebhookSubscriptionStore;
 import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
-import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse, PromptResponse,
+import mcp.server.responses : ToolHandler, MrtrToolHandler, MethodHandler,
+	ToolListFilter, ToolResponse, PromptResponse,
 	PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader, ToolError, PromptError;
 
 // The push-integration unittests below exercise the server seam against the
@@ -237,6 +238,8 @@ final class McpServer : ServerCore
 	private Implementation serverInfo_;
 	private Nullable!string instructions;
 	private RegisteredTool[string] tools;
+	private MethodHandler[string] customMethods_;
+	private ToolListFilter toolListFilter_;
 	private RegisteredResource[string] resources;
 	private RegisteredTemplate[] templates;
 	private RegisteredPrompt[string] prompts;
@@ -1649,6 +1652,50 @@ final class McpServer : ServerCore
 			throw new Exception("enableExtension(\"" ~ identifier ~ "\") would only advertise"
 					~ " an extension this SDK serves; call " ~ remedy ~ " to enable it");
 		advertiseExtension(identifier, settings);
+	}
+
+	/// Serve the application-defined JSON-RPC request `method` (e.g. a
+	/// third-party extension's `groups/list`) with `handler`. The server
+	/// dispatches a request for `method` to `handler` on every transport and
+	/// protocol version, including stateless HTTP requests that never sent
+	/// `initialize`; the handler's return value is the response `result`. An
+	/// `McpException` it throws becomes a JSON-RPC error with that exception's
+	/// code, message and data; any other exception becomes an internal error.
+	/// Throws if `method` is one this SDK serves itself or is already registered.
+	void registerMethod(string method, MethodHandler handler) @safe
+	{
+		import std.algorithm : canFind;
+
+		if (builtInMethods.canFind(method))
+			throw new Exception(
+					"registerMethod(\"" ~ method ~ "\"): the SDK serves this method itself");
+		if (method in customMethods_)
+			throw new Exception("registerMethod(\"" ~ method ~ "\"): already registered");
+		customMethods_[method] = handler;
+	}
+
+	/// The request methods `route` serves itself (plus `events/stream`, which
+	/// the transports serve before routing). `registerMethod` refuses these.
+	private static immutable string[] builtInMethods = [
+		"initialize", "server/discover", "subscriptions/listen", "ping",
+		"tools/list", "tools/call", "resources/list", "resources/templates/list",
+		"resources/read", "resources/directory/read", "skills/list",
+		"skills/get", "resources/subscribe",
+		"resources/unsubscribe", "prompts/list", "prompts/get",
+		"completion/complete", "logging/setLevel", "tasks/get",
+		"tasks/update", "tasks/cancel", "events/list",
+		"events/poll", "events/subscribe", "events/unsubscribe", "events/stream",
+	];
+
+	/// Filter which tools `tools/list` returns, per request: a tool is listed
+	/// only when `keep` returns true for it. `keep` sees the request's context,
+	/// so it can depend on the caller (e.g. on the extensions declared in
+	/// `ctx.clientCapabilities()`). The filter runs before pagination, so pages
+	/// and cursors cover only the listed tools. It does not affect `tools/call`:
+	/// a hidden tool stays callable by name. Pass null to list every tool.
+	void setToolListFilter(ToolListFilter keep) @safe
+	{
+		toolListFilter_ = keep;
 	}
 
 	/// The call that enables a built-in extension, or null for any other
@@ -3067,7 +3114,7 @@ final class McpServer : ServerCore
 		case "tools/list":
 			if (capabilities().tools.isNull)
 				throw methodNotFound(method);
-			return doListTools(params, ver);
+			return doListTools(params, ctx, ver);
 		case "tools/call":
 			if (capabilities().tools.isNull)
 				throw methodNotFound(method);
@@ -3143,6 +3190,8 @@ final class McpServer : ServerCore
 		case "events/unsubscribe":
 			return doEventsUnsubscribe(params, ctx, ver);
 		default:
+			if (auto handler = method in customMethods_)
+				return (*handler)(params, ctx);
 			throw methodNotFound(method);
 		}
 	}
@@ -4036,12 +4085,18 @@ final class McpServer : ServerCore
 		return result.toJson();
 	}
 
-	private Json doListTools(Json params, ProtocolVersion ver) @safe
+	private Json doListTools(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		auto names = sortedToolNames();
+		if (toolListFilter_ !is null)
+			names = names.filter!(name => toolListFilter_(tools[name].descriptor, ctx)).array;
 		// Each tool is projected to the negotiated protocol version (via
 		// `paginatedList` -> `forVersion`) so version-gated fields are not emitted
 		// to peers that don't understand them.
-		return paginatedList!(ListToolsResult, "tools")("tools/list", sortedToolNames(),
+		return paginatedList!(ListToolsResult, "tools")("tools/list", names,
 				(string name) => name, (string name) => tools[name].descriptor, params, ver);
 	}
 
@@ -13889,4 +13944,155 @@ unittest  // an event registration's compiled validator is owned by the runtime
 	static assert(!__traits(compiles, (EventRegistration r) {
 			r.inputValidator = null;
 		}));
+}
+
+unittest  // a registered custom method answers a modern stateless request
+{
+	auto s = makeTestServer();
+	s.registerMethod("groups/list", (Json params, RequestContext ctx) @safe {
+		Json r = Json.emptyObject;
+		r["groups"] = Json([Json(["name": Json("g1")])]);
+		r["echo"] = params["cursor"];
+		return r;
+	});
+	Json p = Json.emptyObject;
+	p["cursor"] = "c1";
+	auto resp = s.handle(modernReq(1, "groups/list", p)).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["groups"][0]["name"].get!string == "g1");
+	assert(resp["result"]["echo"].get!string == "c1");
+}
+
+unittest  // a registered custom method answers a legacy request with no initialize
+{
+	auto s = makeTestServer();
+	s.registerMethod("groups/list", (Json params,
+			RequestContext ctx) @safe => Json(["groups": Json.emptyArray]));
+	auto resp = s.handle(req(1, "groups/list")).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["groups"].length == 0);
+}
+
+unittest  // an unregistered custom method is still -32601
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(modernReq(1, "groups/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // a custom method's McpException code passes through as the JSON-RPC error
+{
+	auto s = makeTestServer();
+	s.registerMethod("groups/get", (Json params, RequestContext) @safe {
+		if (params["name"].get!string != "known")
+			throw new McpException(-32002, "Unknown group: " ~ params["name"].get!string);
+		return Json.emptyObject;
+	});
+	Json p = Json.emptyObject;
+	p["name"] = "nope";
+	auto resp = s.handle(modernReq(1, "groups/get", p)).get;
+	assert(resp["error"]["code"].get!int == -32002, resp.toString);
+	assert(resp["error"]["message"].get!string == "Unknown group: nope");
+}
+
+unittest  // registering a built-in method name throws
+{
+	import std.exception : assertThrown;
+
+	auto s = makeTestServer();
+	MethodHandler h = (Json, RequestContext) @safe => Json.emptyObject;
+	foreach (m; [
+		"tools/list", "tools/call", "initialize", "ping", "skills/list",
+		"tasks/get", "events/poll", "server/discover"
+	])
+		assertThrown(s.registerMethod(m, h));
+}
+
+unittest  // registering the same custom method twice throws
+{
+	import std.exception : assertThrown;
+
+	auto s = makeTestServer();
+	MethodHandler h = (Json, RequestContext) @safe => Json.emptyObject;
+	s.registerMethod("groups/list", h);
+	assertThrown(s.registerMethod("groups/list", h));
+}
+
+unittest  // a tools/list filter hides a tool from the listing but tools/call still reaches it
+{
+	auto s = makeTestServer();
+	Tool hidden = {name: "hidden"};
+	s.registerTool(hidden, (Json) @safe => CallToolResult.text("still here"));
+	s.setToolListFilter((const ref Tool t, RequestContext) @safe => t.name != "hidden");
+
+	auto list = s.handle(modernReq(1, "tools/list")).get;
+	assert(list["result"]["tools"].length == 1, list.toString);
+	assert(list["result"]["tools"][0]["name"].get!string == "add");
+
+	Json p = Json.emptyObject;
+	p["name"] = "hidden";
+	p["arguments"] = Json.emptyObject;
+	auto call = s.handle(modernReq(2, "tools/call", p)).get;
+	assert("error" !in call, call.toString);
+	assert(call["result"]["content"][0]["text"].get!string == "still here");
+}
+
+unittest  // a tools/list filter applies before pagination so pages stay full and consistent
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateless("t", "1");
+	foreach (n; ["a", "b", "c", "d", "e", "f"])
+	{
+		Tool t = {name: n};
+		s.registerTool(t, (Json) @safe => CallToolResult());
+	}
+	s.setPageSize(2);
+	s.setToolListFilter((const ref Tool t, RequestContext) @safe => t.name != "b" && t.name != "c");
+
+	string[] seen;
+	Json p = Json.emptyObject;
+	foreach (i; 0 .. 5)
+	{
+		auto resp = s.handle(modernReq(i + 1, "tools/list", p)).get;
+		assert("error" !in resp, resp.toString);
+		auto page = resp["result"];
+		assert(page["tools"].length == 2, page.toString);
+		foreach (k; 0 .. page["tools"].length)
+			seen ~= page["tools"][k]["name"].get!string;
+		if ("nextCursor" !in page || page["nextCursor"].type != Json.Type.string)
+			break;
+		p = Json.emptyObject;
+		p["cursor"] = page["nextCursor"];
+	}
+	assert(seen == ["a", "d", "e", "f"], seen.to!string);
+}
+
+unittest  // a tools/list filter sees the extensions the client declared in the request _meta
+{
+	auto s = makeTestServer();
+	Tool scoped = {name: "scoped"};
+	s.registerTool(scoped, (Json) @safe => CallToolResult());
+	s.setToolListFilter((const ref Tool t, RequestContext ctx) @safe {
+		const ext = ctx.clientCapabilities().extensions;
+		const groupsAware = ext.type == Json.Type.object
+			&& ("io.modelcontextprotocol/groups" in ext) !is null;
+		return !(groupsAware && t.name == "scoped");
+	});
+
+	// modernReq declares only the Tasks extension, so the scoped tool is listed.
+	auto plain = s.handle(modernReq(1, "tools/list")).get;
+	assert(plain["result"]["tools"].length == 2, plain.toString);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/groups"] = Json.emptyObject;
+	meta[MetaKey.clientCapabilities] = Json(["extensions": ext]);
+	Json p = Json.emptyObject;
+	p["_meta"] = meta;
+	auto aware = s.handle(Message(makeRequest(Json(2), "tools/list", p))).get;
+	assert(aware["result"]["tools"].length == 1, aware.toString);
+	assert(aware["result"]["tools"][0]["name"].get!string == "add");
 }

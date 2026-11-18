@@ -8957,3 +8957,90 @@ unittest  // stateless: an unauthenticated caller cannot cancel another caller's
 	assert(!cancelled, "an anonymous caller must not cancel another anonymous caller's request");
 	assert(callStatus == 200);
 }
+
+unittest  // a modern stateless POST reaches a registered custom method
+{
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.data.json : parseJsonString;
+	import vibe.http.client : requestHTTP;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import vibe.stream.operations : readAllUTF8;
+
+	auto server = McpServer.stateless("t", "1");
+	server.registerMethod("groups/get", (Json params, RequestContext) @safe {
+		if (params["name"].get!string == "g1")
+			return Json(["name": Json("g1")]);
+		throw new McpException(-32002, "Unknown group");
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	// A client disconnect cancels a modern request, so the request goes over a
+	// real connection rather than a test response.
+	Json ok, missing;
+	string failure;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			const url = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/mcp";
+			Json post(string name) @safe
+			{
+				const body_ = `{"jsonrpc":"2.0","id":1,"method":"groups/get","params":{"name":"`
+					~ name ~ `","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+					~ `"io.modelcontextprotocol/clientInfo":{"name":"c","version":"1"},`
+					~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+				string text;
+				requestHTTP(url, (scope creq) {
+					creq.method = HTTPMethod.POST;
+					creq.headers["Accept"] = "application/json, text/event-stream";
+					creq.headers["MCP-Protocol-Version"] = "2026-07-28";
+					creq.headers["Mcp-Method"] = "groups/get";
+					creq.writeBody(cast(const(ubyte)[]) body_, "application/json");
+				}, (scope cres) { text = cres.bodyReader.readAllUTF8(); });
+				return parseJsonString(text);
+			}
+
+			ok = post("g1");
+			missing = post("nope");
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(failure.length == 0, failure);
+	assert(ok["result"]["name"].get!string == "g1", ok.toString());
+	assert(missing["error"]["code"].get!int == -32002, missing.toString());
+}
+
+unittest  // a bare legacy POST with no initialize reaches a registered custom method
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.registerMethod("groups/list", (Json params,
+			RequestContext ctx) @safe => Json(["groups": Json.emptyArray]));
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(`{"jsonrpc":"2.0","id":1,"method":"groups/list","params":{}}`,
+			["Accept": "application/json"]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["result"]["groups"].length == 0, resp.toString());
+}

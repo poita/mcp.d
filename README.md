@@ -29,6 +29,7 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 - [MCP Tasks (asynchronous execution)](#mcp-tasks-asynchronous-execution)
 - [MCP Events (triggers)](#mcp-events-triggers)
 - [Skills](#skills)
+- [Custom extensions](#custom-extensions)
 - [Concurrency model](#concurrency-model)
 - [Running the conformance suite](#running-the-conformance-suite)
 - [Contributing](#contributing)
@@ -1272,6 +1273,35 @@ entry in the `extensions` negotiation map carries that floor), where the base
 protocol has no `CacheableResult` and the results carry neither field; the
 resource reads themselves work on any version. See
 [`examples/skills`](examples/skills/) for the full e2e.
+
+## Custom extensions
+
+To serve a protocol extension the SDK does not implement, advertise it with
+`enableExtension`, answer its methods with `registerMethod`, and, if it changes
+what `tools/list` shows a given client, install a per-request
+`setToolListFilter`:
+
+```d
+server.enableExtension("io.modelcontextprotocol/groups");
+server.registerMethod("groups/get", (Json params, RequestContext ctx) @safe {
+    auto name = params["name"].get!string;
+    if (auto g = name in groups)
+        return *g;
+    throw new McpException(-32002, "Unknown group: " ~ name);
+});
+server.setToolListFilter((const ref Tool tool, RequestContext ctx) @safe {
+    const ext = ctx.clientCapabilities().extensions;
+    const groupsAware = ext.type == Json.Type.object
+        && ("io.modelcontextprotocol/groups" in ext) !is null;
+    return !(groupsAware && isScoped(tool.name));
+});
+```
+
+A registered method is served on every transport and protocol version,
+including stateless HTTP requests that never sent `initialize`. An
+`McpException` thrown by the handler becomes a JSON-RPC error with its code.
+Registering a method the SDK serves itself throws. The tool filter runs before
+pagination and does not affect `tools/call`, so hidden tools stay callable.
 
 ## Concurrency model
 
